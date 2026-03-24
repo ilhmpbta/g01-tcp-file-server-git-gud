@@ -3,7 +3,7 @@ import struct
 import os
 
 class Client:
-    def __init__(self, HOST, PORT, download_dir="~"):
+    def __init__(self, HOST, PORT, download_dir="~/Downloads"):
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.connect((HOST, PORT))
 
@@ -58,7 +58,13 @@ class Client:
         self.socket.sendall(header + data)
     
     def send_file(self, path, chunk_size=4096):
-        pass
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                self.socket.sendall(struct.pack(">I", len(chunk)) + chunk)
+        self.socket.sendall(struct.pack(">I", 0))
     
     def recv_file(self, path):
         with open(path, "wb") as f:
@@ -77,8 +83,9 @@ class Client:
         print(data.decode())
 
     def upload(self, path):
-        pass
-            
+        self.send_msg(f"/upload {os.path.basename(path)}".encode())
+        self.send_file(path)
+
     def download(self, filename):
         self.send_msg(f"/download {filename}".encode())
         filepath = f"{self.download_dir}/{filename}"
