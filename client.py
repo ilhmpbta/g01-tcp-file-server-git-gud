@@ -3,7 +3,7 @@ import struct
 import os
 
 class Client:
-    def __init__(self, HOST, PORT, download_dir="~/Downloads"):
+    def __init__(self, HOST, PORT, download_dir):
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.connect((HOST, PORT))
 
@@ -98,10 +98,8 @@ class Client:
         
 
 if __name__ == "__main__":
-    # server_ip = input("Enter server's IP: ").strip()
-    # server_port = int(input("Enter server's port: ").strip())
+    server_ip = input("Enter server's IP: ").strip()
+    server_port = int(input("Enter server's port: ").strip())
+    download_dir = input("Enter download directory: ").strip() or os.getcwd()
 
-    server_ip = '127.0.0.1'
-    server_port = 6767
-
-    Client(server_ip, server_port)
+    Client(server_ip, server_port, download_dir)
