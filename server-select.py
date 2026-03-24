@@ -8,6 +8,7 @@ class Server:
         self.server_socket.listen(5)
         self.input_sockets = [self.server_socket]
         self.root_dir = os.path.expanduser(root_dir)
+        self.clients = []
 
         while True:
             read_ready, _, _ = select.select(self.input_sockets, [], [])
@@ -16,7 +17,9 @@ class Server:
                 if sock == self.server_socket:
                     client_socket, client_addr = self.server_socket.accept()
                     self.input_sockets.append(client_socket)
+                    self.clients.append(client_socket)
                     print(f"Connected: {client_addr}")
+                    self.broadcast_msg(f"Client {client_addr} has connected.", exclude_sock=client_socket)
                 else:
                     try:
                         command_payload = self.recv_msg(sock)
@@ -37,7 +40,8 @@ class Server:
 
                         if message.startswith("/download "):
                             filename = message.split(maxsplit=1)[1].strip()
-                            self.handle_download(sock, filename)
+                            if self.handle_download(sock, filename):
+                                self.broadcast_msg(f"Client {sock.getpeername()} has successfully downloaded {filename}", exclude_sock=sock)
                             continue
 
                         if message == "/download":
@@ -47,9 +51,13 @@ class Server:
 
                         if message.startswith("/upload "):
                             filename = message.split(maxsplit=1)[1].strip()
-                            self.handle_upload(sock, filename)
-                            resp = "upload: upload successful!\n"
-                            self.send_msg(sock, resp.encode())
+                            if self.handle_upload(sock, filename):
+                                resp = "upload: upload successful!\n"
+                                self.send_msg(sock, resp.encode())
+                                self.broadcast_msg(f"Client {sock.getpeername()} has uploaded {filename}", exclude_sock=sock)
+                            else:
+                                resp = "upload: upload failed!\n"
+                                self.send_msg(sock, resp.encode())
                             continue
 
                         if message == "/upload":
@@ -69,6 +77,11 @@ class Server:
     def send_msg(self, sock, data):
         header = struct.pack(">I", len(data))
         sock.sendall(header + data)
+    
+    def broadcast_msg(self, message, exclude_sock=None):
+        for client in self.clients:
+            if client != exclude_sock:
+                self.send_msg(client, message.encode())
 
     def recv_msg(self, sock):
         header = sock.recv(4)
@@ -94,22 +107,26 @@ class Server:
 
     def handle_upload(self, sock, filename):
         file_path = os.path.join(self.root_dir, filename)
-
-        with open(file_path, "wb") as f:
-            while True:
-                header = sock.recv(4)
-                if len(header) < 4:
-                    break
-                chunk_size = struct.unpack(">I", header)[0]
-                if chunk_size == 0:
-                    break
-                chunk = sock.recv(chunk_size)
-                f.write(chunk)
+        try:
+            with open(file_path, "wb") as f:
+                while True:
+                    header = sock.recv(4)
+                    if len(header) < 4:
+                        break
+                    chunk_size = struct.unpack(">I", header)[0]
+                    if chunk_size == 0:
+                        break
+                    chunk = sock.recv(chunk_size)
+                    f.write(chunk)
+            return True
+        except (OSError, IOError):
+            return False
 
     def handle_download(self, sock, filename):
         filepath = os.path.join(self.root_dir, filename)
         if not os.path.isfile(filepath):
             sock.sendall(struct.pack(">I", 0))
+            return False
         else:
             with open(filepath, "rb") as f:
                 while True:
@@ -118,6 +135,7 @@ class Server:
                         break
                     sock.sendall(struct.pack(">I", len(chunk)) + chunk)
             sock.sendall(struct.pack(">I", 0))
+            return True
 
 if __name__ == "__main__":
     server = Server('127.0.0.1', 6767)

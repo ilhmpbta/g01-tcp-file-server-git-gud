@@ -14,6 +14,7 @@ class Server:
 
         self.fd_map = {self.server_socket.fileno(): self.server_socket}
         self.send_buffers = {}
+        self.clients = []
 
         while True:
             for fd, event in self.poll_object.poll():
@@ -25,11 +26,15 @@ class Server:
                         conn.setblocking(False)
                         self.fd_map[conn.fileno()] = conn
                         self.poll_object.register(conn.fileno(), select.POLLIN)
+                        self.clients.append(conn)
                         print(f"Connected: {addr}")
+                        self.broadcast_msg(f"Client {addr} has connected.", exclude_sock=conn)
                     
                     elif event & select.POLLIN:
                         command_payload = self.recv_msg(sock)
                         if command_payload is None:
+                            if sock in self.clients:
+                                self.clients.remove(sock)
                             self.poll_object.unregister(sock.fileno())
                             print(f"Connection closed by {sock.getpeername()}")
                             del self.fd_map[sock.fileno()]
@@ -62,6 +67,7 @@ class Server:
                                         buffer += struct.pack(">I", len(chunk)) + chunk
                                 buffer += struct.pack(">I", 0)
                                 self.send_buffers[sock.fileno()] = buffer
+                                self.broadcast_msg(f"Client {sock.getpeername()} has successfully downloaded {filename}", exclude_sock=sock)
 
                             self.poll_object.modify(sock.fileno(), select.POLLOUT)
                             continue
@@ -75,9 +81,12 @@ class Server:
                         if message.startswith("/upload "):
                             filename = message.split(maxsplit=1)[1].strip()
                             sock.setblocking(True)
-                            self.handle_upload(sock, filename)
+                            if self.handle_upload(sock, filename):
+                                resp = "upload: upload successful!\n".encode()
+                                self.broadcast_msg(f"Client {sock.getpeername()} has uploaded {filename}", exclude_sock=sock)
+                            else:
+                                resp = "upload: upload failed!\n".encode()
                             sock.setblocking(False)
-                            resp = "upload: upload successful!\n".encode()
                             self.send_buffers[sock.fileno()] = struct.pack(">I", len(resp)) + resp
                             self.poll_object.modify(sock.fileno(), select.POLLOUT)
                             continue
@@ -101,6 +110,8 @@ class Server:
                             self.poll_object.modify(sock.fileno(), select.POLLIN)
 
                     if event & (select.POLLHUP | select.POLLERR | select.POLLNVAL):
+                        if sock in self.clients:
+                            self.clients.remove(sock)
                         self.poll_object.unregister(sock.fileno())
                         print(f"Connection error with {sock.getpeername()}")
                         del self.fd_map[sock.fileno()]
@@ -109,6 +120,8 @@ class Server:
                 except (ConnectionResetError, OSError) as e:
                     if fd in self.fd_map:
                         sock = self.fd_map[fd]
+                        if sock in self.clients:
+                            self.clients.remove(sock)
                         if sock.fileno() >= 0:
                             self.poll_object.unregister(sock.fileno())
                         print(f"Connection error: {e}")
@@ -118,6 +131,16 @@ class Server:
     def send_msg(self, sock, data):
         header = struct.pack(">I", len(data))
         sock.sendall(header + data)
+    
+    def broadcast_msg(self, message, exclude_sock=None):
+        for client in self.clients:
+            if client != exclude_sock:
+                try:
+                    msg_encoded = message.encode()
+                    header = struct.pack(">I", len(msg_encoded))
+                    client.sendall(header + msg_encoded)
+                except (OSError, ConnectionError):
+                    pass
 
     def recv_msg(self, sock):
         header = sock.recv(4)
@@ -143,17 +166,20 @@ class Server:
 
     def handle_upload(self, sock, filename):
         file_path = os.path.join(self.root_dir, filename)
-
-        with open(file_path, "wb") as f:
-            while True:
-                header = sock.recv(4)
-                if len(header) < 4:
-                    break
-                chunk_size = struct.unpack(">I", header)[0]
-                if chunk_size == 0:
-                    break
-                chunk = sock.recv(chunk_size)
-                f.write(chunk)
+        try:
+            with open(file_path, "wb") as f:
+                while True:
+                    header = sock.recv(4)
+                    if len(header) < 4:
+                        break
+                    chunk_size = struct.unpack(">I", header)[0]
+                    if chunk_size == 0:
+                        break
+                    chunk = sock.recv(chunk_size)
+                    f.write(chunk)
+            return True
+        except (OSError, IOError):
+            return False
 
     def handle_download(self, sock, filename):
         filepath = os.path.join(self.root_dir, filename)
