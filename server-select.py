@@ -119,14 +119,22 @@ class Server:
         try:
             with open(file_path, "wb") as f:
                 while True:
-                    header = sock.recv(4)
-                    if len(header) < 4:
+                    tag_header = sock.recv(1)
+                    if len(tag_header) < 1:
                         break
-                    chunk_size = struct.unpack(">I", header)[0]
-                    if chunk_size == 0:
+                    tag, = struct.unpack(">B", tag_header)
+                    
+                    length_header = sock.recv(4)
+                    if len(length_header) < 4:
                         break
-                    chunk = sock.recv(chunk_size)
-                    f.write(chunk)
+                    chunk_size = struct.unpack(">I", length_header)[0]
+                    
+                    if tag == T_FEND:
+                        break
+                    
+                    if tag == T_FCHUNK:
+                        chunk = sock.recv(chunk_size)
+                        f.write(chunk)
             return True
         except (OSError, IOError):
             return False
