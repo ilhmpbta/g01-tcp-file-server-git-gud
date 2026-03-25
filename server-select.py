@@ -1,5 +1,11 @@
 import socket, select, os, struct
 
+T_FREADY = 0x10
+T_FCHUNK = 0x11
+T_FEND = 0x12
+T_FNOTFOUND = 0x19
+T_MSG = 0x21
+
 class Server:
     def __init__(self, host, port, root_dir="~/workspace/college/progjar/g01-tcp-file-server-git-gud"):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -74,8 +80,8 @@ class Server:
                             self.input_sockets.remove(sock)
                         sock.close()
 
-    def send_msg(self, sock, data):
-        header = struct.pack(">I", len(data))
+    def send_msg(self, sock, data, tag=T_MSG):
+        header = struct.pack(">BI", tag, len(data))
         sock.sendall(header + data)
     
     def broadcast_msg(self, message, exclude_sock=None):
@@ -84,12 +90,15 @@ class Server:
                 self.send_msg(client, message.encode())
 
     def recv_msg(self, sock):
-        header = sock.recv(4)
-
-        if len(header) < 4:
+        tag_header = sock.recv(1)
+        if len(tag_header) < 1:
             return None
 
-        length = struct.unpack(">I", header)[0]
+        length_header = sock.recv(4)
+        if len(length_header) < 4:
+            return None
+
+        length = struct.unpack(">I", length_header)[0]
 
         buffer = b''
         while len(buffer) < length:
@@ -125,16 +134,17 @@ class Server:
     def handle_download(self, sock, filename):
         filepath = os.path.join(self.root_dir, filename)
         if not os.path.isfile(filepath):
-            sock.sendall(struct.pack(">I", 0))
+            self.send_msg(sock, b"", tag=T_FNOTFOUND)
             return False
         else:
+            self.send_msg(sock, filename.encode(), tag=T_FREADY)
             with open(filepath, "rb") as f:
                 while True:
                     chunk = f.read(4096)
                     if not chunk:
                         break
-                    sock.sendall(struct.pack(">I", len(chunk)) + chunk)
-            sock.sendall(struct.pack(">I", 0))
+                    self.send_msg(sock, chunk, tag=T_FCHUNK)
+            self.send_msg(sock, b"", tag=T_FEND)
             return True
 
 if __name__ == "__main__":

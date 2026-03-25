@@ -1,5 +1,11 @@
 import socket, select, os, struct
 
+T_FREADY = 0x10
+T_FCHUNK = 0x11
+T_FEND = 0x12
+T_FNOTFOUND = 0x19
+T_MSG = 0x21
+
 class Server:
     def __init__(self, host, port, root_dir="~/workspace/college/progjar/g01-tcp-file-server-git-gud"):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -47,7 +53,7 @@ class Server:
                         if message == "/list":
                             files = self.list_files()
                             payload = ("\n".join(files) + "\n").encode() if files else b"(empty)\n"
-                            self.send_buffers[sock.fileno()] = struct.pack(">I", len(payload)) + payload
+                            self.send_buffers[sock.fileno()] = struct.pack(">BI", T_MSG, len(payload)) + payload
                             self.poll_object.modify(sock.fileno(), select.POLLOUT)
                             continue
 
@@ -56,16 +62,16 @@ class Server:
                             filepath = os.path.join(self.root_dir, filename)
 
                             if not os.path.isfile(filepath):
-                                self.send_buffers[sock.fileno()] = struct.pack(">I", 0)
+                                self.send_buffers[sock.fileno()] = struct.pack(">B", T_FNOTFOUND)
                             else:
-                                buffer = b""
+                                buffer = struct.pack(">BI", T_FREADY, len(filename)) + filename.encode()
                                 with open(filepath, "rb") as f:
                                     while True:
                                         chunk = f.read(4096)
                                         if not chunk:
                                             break
-                                        buffer += struct.pack(">I", len(chunk)) + chunk
-                                buffer += struct.pack(">I", 0)
+                                        buffer += struct.pack(">BI", T_FCHUNK, len(chunk)) + chunk
+                                buffer += struct.pack(">B", T_FEND)
                                 self.send_buffers[sock.fileno()] = buffer
                                 self.broadcast_msg(f"Client {sock.getpeername()} has successfully downloaded {filename}", exclude_sock=sock)
 
@@ -74,7 +80,7 @@ class Server:
 
                         if message == "/download":
                             resp = "Usage: /download <filename>\n".encode()
-                            self.send_buffers[sock.fileno()] = struct.pack(">I", len(resp)) + resp
+                            self.send_buffers[sock.fileno()] = struct.pack(">BI", T_MSG, len(resp)) + resp
                             self.poll_object.modify(sock.fileno(), select.POLLOUT)
                             continue
 
@@ -87,18 +93,18 @@ class Server:
                             else:
                                 resp = "upload: upload failed!\n".encode()
                             sock.setblocking(False)
-                            self.send_buffers[sock.fileno()] = struct.pack(">I", len(resp)) + resp
+                            self.send_buffers[sock.fileno()] = struct.pack(">BI", T_MSG, len(resp)) + resp
                             self.poll_object.modify(sock.fileno(), select.POLLOUT)
                             continue
 
                         if message == "/upload":
                             resp = "Usage: /upload <filename>\n".encode()
-                            self.send_buffers[sock.fileno()] = struct.pack(">I", len(resp)) + resp
+                            self.send_buffers[sock.fileno()] = struct.pack(">BI", T_MSG, len(resp)) + resp
                             self.poll_object.modify(sock.fileno(), select.POLLOUT)
                             continue
 
                         resp = "Unknown command.\n".encode()
-                        self.send_buffers[sock.fileno()] = struct.pack(">I", len(resp)) + resp
+                        self.send_buffers[sock.fileno()] = struct.pack(">BI", T_MSG, len(resp)) + resp
                         self.poll_object.modify(sock.fileno(), select.POLLOUT)
                     
                     elif event & select.POLLOUT:
@@ -128,8 +134,8 @@ class Server:
                         del self.fd_map[fd]
                         sock.close()
 
-    def send_msg(self, sock, data):
-        header = struct.pack(">I", len(data))
+    def send_msg(self, sock, data, tag=T_MSG):
+        header = struct.pack(">BI", tag, len(data))
         sock.sendall(header + data)
     
     def broadcast_msg(self, message, exclude_sock=None):
@@ -137,18 +143,20 @@ class Server:
             if client != exclude_sock:
                 try:
                     msg_encoded = message.encode()
-                    header = struct.pack(">I", len(msg_encoded))
-                    client.sendall(header + msg_encoded)
+                    self.send_msg(client, msg_encoded)
                 except (OSError, ConnectionError):
                     pass
 
     def recv_msg(self, sock):
-        header = sock.recv(4)
-
-        if len(header) < 4:
+        tag_header = sock.recv(1)
+        if len(tag_header) < 1:
             return None
 
-        length = struct.unpack(">I", header)[0]
+        length_header = sock.recv(4)
+        if len(length_header) < 4:
+            return None
+
+        length = struct.unpack(">I", length_header)[0]
 
         buffer = b''
         while len(buffer) < length:
