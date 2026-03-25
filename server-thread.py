@@ -144,5 +144,8 @@ class Server:
                     pass
 
 if __name__ == "__main__":
-    server = Server("127.0.0.1", 6767, '~')
+    server_port = int(input("Enter server's port: ").strip())
+    root_dir = input("Enter server's root directory: ").strip() or os.path.expanduser('~')
+
+    server = Server("127.0.0.1", server_port, root_dir)
     server.run()
