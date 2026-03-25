@@ -10,7 +10,7 @@
 ## Link Youtube (Unlisted)
 Link ditaruh di bawah ini
 ```
-
+https://youtu.be/MO_emYjdFM4
 ```
 
 ## Penjelasan Program
@@ -35,14 +35,17 @@ def start(self):
     try:
         while True:
             client_sock, client_addr = self.socket.accept()
-
             print(f"Connected by {client_addr}")
+            
             while True:
-                data = recv_msg(client_sock)
-                if not data:
+                header = client_sock.recv(1)
+
+                if not header:
+                    client_sock.close()
+                    print(f"Disconnected from {client_addr}")
                     break
 
-                command = data.decode()
+                command = recv_msg(client_sock).decode()
 
                 if command.startswith('/list'):
                     self.handle_list(client_sock)
@@ -51,7 +54,7 @@ def start(self):
                     self.handle_upload(client_sock, filename)
                 elif command.startswith('/download'):
                     filename = command.split(maxsplit=1)[1]
-                    self.handle_download(client_sock, filename)  
+                    self.handle_download(client_sock, filename)
     except KeyboardInterrupt:
         self.socket.close()
 ```
@@ -59,9 +62,6 @@ def start(self):
 Pada bagian `accept()`, program akan berhenti (blocking) dan menunggu sampai suatu client membuka koneksi dengan server. Setelah koneksi terjalin, program masuk ke infinite loop dimana program akan terus menerus menerima data sampai client menutup koneksi dengan server. Konsekuensi dari perilaku program ini adalah client lain yang terkoneksi setelah server telah terkoneksi harus menunggu di backlog server socket. Setiap payload yang dikirim oleh client tersebut akan diabaikan oleh server.
 
 #### Server: `server-select.py`
-
-> Before we start our work, let's say  
-> أَعُوذُ بِاللَّهِ مِنَ الشَّيْطَانِ الرَّجِيمِ
 
 Konsep utama dari select adalah I/O Multiplexing. Sederhananya, select memungkinkan server untuk "mengawasi" banyak koneksi sekaligus dalam satu thread tanpa harus menunggu (blocking) di salah satu koneksi saja.
 
@@ -109,9 +109,6 @@ Konsep utama dari select adalah I/O Multiplexing. Sederhananya, select memungkin
 #### Server: `server-poll.py`
 
 Meskipun tujuannya sama (I/O Multiplexing), poll bekerja sedikit berbeda. Jika select menggunakan list socket, poll menggunakan File Descriptor (fd) dan Event Mask.
-
-> Before we start our work, let's say  
-> أَعُوذُ بِاللَّهِ مِنَ الشَّيْطَانِ الرَّجِيمِ
 
 1. **Non-Blocking dan Poll Object**
 
@@ -187,40 +184,40 @@ def run(self):
     try:
         while True:
             client_sock, client_addr = self.socket.accept()
+            self.clients.append(client_sock)
             print(f"Connected by {client_addr}")
+            self.broadcast_msg(f"Client {client_addr} has connected.", exclude_sock=client_sock)
 
-            client = {'client_socket': client_sock, 'client_addr': client_addr}
-
-            self.clients.append(client)
-            Thread(target = self.handle_new_client, args=(client,)).start()                    
+            Thread(target=self.handle_new_client, args=(client_sock, client_addr)).start()                    
     except KeyboardInterrupt:
         self.socket.close()
-
         for client in self.clients:
-            client['client_socket'].close()
+            client.close()
 
-def handle_new_client(self, client):
-    client_sock = client['client_socket']
+def handle_new_client(self, client_sock, client_addr):
     running = 1
     while running:
-        data = recv_msg(client_sock)
+        header = client_sock.recv(1)
 
-        if not data:
-            self.clients.remove(client)
+        if not header: 
+            self.clients.remove(client_sock)
             client_sock.close()
             running = 0
+            self.broadcast_msg(f"Client {client_addr} has disconnected", exclude_sock=client_sock)
             break
 
-        command = data.decode()
+        command = recv_msg(client_sock).decode()
 
         if command.startswith('/list'):
             self.handle_list(client_sock)
         elif command.startswith('/upload'):
             filename = command.split(maxsplit=1)[1]
-            self.handle_upload(client_sock, filename)
+            if self.handle_upload(client_sock, filename):
+                self.broadcast_msg(f"Client {client_addr} has uploaded {filename}", exclude_sock=client_sock)
         elif command.startswith('/download'):
             filename = command.split(maxsplit=1)[1]
-            self.handle_download(client_sock, filename)  
+            if self.handle_download(client_sock, filename):
+                self.broadcast_msg(f"Client {client_addr} has successfully downloaded {filename}", exclude_sock=client_sock)  
 ```
 
 List `clients` digunakan untuk menyimpan informasi client yang masih terkoneksi. Setiap client baru akan dimasukkan ke dalam list tersebut dan kemudian diberikan suatu thread khusus. Setiap thread yang di-spawn akan langsung menjalankan fungsi `handle_new_client()` yang kurang lebih berisi logika yang sama seperti teknik lain. Apabila client memutus koneksi, yang mana client akan mengirimkan empty packet, fungsi tersebut akan menghapus client dari list dan memutus socket client pada server.
@@ -230,77 +227,104 @@ Perlu diketahui bahwa call `accept()` pada potongan tersebut masih melakukan blo
 
 #### Client: `client.py`
 
-Dokumen ini menjelaskan arsitektur internal dari client.py, dengan fokus pada bagaimana aplikasi menangani pesan secara asinkron menggunakan threading dan bagaimana ia mengelola aliran data (file passing) secara aman.
+Secara umum, seharusnya implementasi client cukup simpel dan dapat dilakukan secara synchronous. Namun, kebutuhan akan broadcast tidak dapat dipenuhi hanya dengan pendekatan synchronous. Untuk itu, pada file `client.py` diimplementasikan threading, yakni satu main thread yang bertugas untuk handling input command dan satu thread tambahan yang bertanggung jawab penuh atas receiving payload. 
 
-1. **Mekanisme Threading untuk Listening Broadcast**
+Perhatikan definisi method `__init__` berikut. Seketika instance `Client` dibuat, program langsung membuat thread yang memanggil method `receive_all` yang bertugas untuk blocking `recv()` setiap data yang dikirimkan. Setelah pembuatan thread dan kemudian dijalankan, program akan memanggil method `handle_command()` yang berisi logika untuk handling input command. 
+```python
+def __init__(self, HOST, PORT, download_dir):
+    self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    self.socket.connect((HOST, PORT))
 
-    Client perlu mendengarkan pesan dari server (seperti notifikasi "User joined" atau pesan chat) sambil tetap menunggu input perintah dari pengguna. Untuk mencapai ini, client.py memisahkan tugas tersebut ke dalam thread yang berbeda.
+    self.download_dir = os.path.expanduser(download_dir)
+    self.running = True
 
-    ```python
-    # Inisialisasi thread di dalam __init__
-    self.socket_read_lock = threading.Lock()
-    listener_thread = threading.Thread(target=self.listen_for_messages, daemon=True)
-    listener_thread.start()
-    ```
+    threading.Thread(target=self.receive_all, daemon=True).start()
 
-    - Sinkronisasi menggunakan lock & queue
+    self.handle_command()
+```
+
+Seketika user menginputkan suatu command yang valid, `handle_command()` langsung melakukan parsing terhadap input dan mengirimkannya sebagai payload terhadap server. Logika ini terus menerus berjalan hingga program menerima exception `KeyboardInterrupt`.
+```python
+def handle_command(self):
+    try:
+        while True:
+            args = input().strip().split(maxsplit=1)
+
+            if not args:
+                continue
+
+            if args[0] in ['/upload', '/download'] and len(args) < 2:
+                print("Missing second argument.")
+                continue
+
+            if args[0] == "/list":
+                self.send_msg(b"/list")
+            elif args[0] == "/upload":
+                filename = os.path.basename(args[1])
+                if os.path.isfile(filename):
+                    self.send_msg(f"/upload {filename}".encode())
+                    self.send_file(filename)    
+                else:
+                    print(f"File {filename} does not exist.")
+            elif args[0] == "/download":
+                self.send_msg(f"/download {os.path.basename(args[1])}".encode())
+            else:
+                print("Command unidentified.")
+                continue
+    except KeyboardInterrupt:
+        print("\nDisconnected by keyboard interrupt. Exiting...")
+    finally:
+        self.socket.close()
+```
+
+Pada `receive_all()`, dilakukan blocking `recv()` dimana setiap payload diekstrak dari header tag. Berdasarkan nilai `tag` ini, client dapat memastikan penanganan mana yang sesuai untuk jenis payload tertentu.
+```python
+def receive_all(self):
+    filename = ''
+    filepath = ''
+    file = None
+
+    while self.running:
+        header = self.socket.recv(1)
         
-        Karena dua thread (Thread Utama dan Thread Listener) berbagi satu koneksi yang sama, risiko terjadinya collision sangat besar. Maka kita gunakan readlock dan queue
+        if not header: 
+            break
 
-        ```py
-        def listen_for_messages(self):
-            while self.running:
-                # Mencoba mendapatkan akses ke socket dengan timeout agar tidak deadlock
-                if not self.socket_read_lock.acquire(timeout=0.1):
-                    continue
-                try:
-                    msg = self._read_msg()
-                    if msg is None: break
-                    
-                    # Jika pesan berisi kata kunci tertentu, langsung cetak (Notifikasi)
-                    # Jika tidak, masukkan ke antrean (Data Respon)
-                    self.response_queue.put(msg)
-                finally:
-                    self.socket_read_lock.release()
-        ```
+        tag, = struct.unpack(">B", header)
 
-        - Socket Read Lock: Digunakan untuk memastikan hanya satu thread yang membaca dari socket pada satu waktu.
-        - Response Queue: Jika pesan yang masuk bukan notifikasi umum, pesan tersebut disimpan dalam antrean (Queue) agar bisa diambil oleh thread utama saat dibutuhkan.
+        if tag == T_MSG:
+            msg = self.recv_msg()
+            print(msg.decode())
 
-2. **Peran Client dalam Passing File**
+        elif tag == T_FREADY:
+            filename = self.recv_msg().decode()
+            print(f"Server is ready to send {filename}.")
+            filepath = os.path.join(self.download_dir, filename)
+            file = open(filepath, "wb")
 
-    client.py bertanggung jawab untuk memastikan file yang dikirim (upload) atau diterima (download) tidak rusak dan sampai secara utuh melalui jaringan.
+        elif tag == T_FNOTFOUND:
+            filename = self.recv_msg().decode()
+            print(f"{filename} does not exist on the server.")
+            filename = ''
 
-    - Protokol Header (Framing)
+        elif tag == T_FCHUNK:
+            print(f"Downloading {filename}...")
+            length = struct.unpack(">I", self.socket.recv(4))[0]
+            buffer = b""
+            while len(buffer) < length:
+                buffer += self.socket.recv(length - len(buffer))
+            file.write(buffer)
 
-        ```py
-        def send_msg(self, data):
-            # Mengemas panjang data ke dalam 4 byte (Big-endian unsigned int)
-            header = struct.pack(">I", len(data))
-            self.socket.sendall(header + data)
-        ```
+        elif tag == T_FEND:
+            if file:
+                file.close()
+                file = None
+            print(f"{filename} downloaded")
+            filename = ''
+            filepath = ''
+```
 
-    - File Chunking
 
-        ```py
-        def send_file(self, path, chunk_size=4096):
-            with open(path, "rb") as f:
-                while True:
-                    chunk = f.read(chunk_size)
-                    if not chunk: 
-                        break # Selesai membaca file
-                    
-                    # Kirim setiap potongan dengan header panjangnya
-                    self.socket.sendall(struct.pack(">I", len(chunk)) + chunk)
-                    
-            # Sinyal Selesai: Mengirim header dengan panjang 0
-            self.socket.sendall(struct.pack(">I", 0))
-        ```
-
-3. **Safety**
-    - Eksklusivitas Socket: Saat melakukan upload atau download, thread utama memegang socket_read_lock secara penuh. Ini menghentikan sementara thread pendengar agar byte-byte file tidak tertukar dengan pesan teks biasa.
-
-    - Pembersihan Queue: Setelah download selesai, client membersihkan sisa pesan di response_queue untuk memastikan kondisi state client kembali bersih sebelum menerima perintah berikutnya.
 
 ### Features
 
@@ -380,39 +404,46 @@ def handle_list(self, sock):
             if entry.is_file():
                 filenames.append(entry.name)
 
-    send_msg(sock, ("\n".join(filenames) + "\n").encode())
+    send_msg(sock, T_MSG, ("\n".join(filenames) + "\n").encode())
 ```
 
-Karena permintaan tugas adalah mendaftar semua file yang ada di server, logikanya menjadi cukup sederhana. Menggunakan bantuan module os, scandir dapat digunakan untuk mendapatkan iterables berupa seluruh entri yang ada di dalam suatu direktori. Iterables kemudian dipilah sehingga hanya diambil nama entri dari suatu file saja. Hasil pemilihan akan menghasilkan array `filenames` yang selanjutnya dijadikan payload untuk dikirimkan ke client.
+Karena permintaan tugas adalah mendaftar semua file yang ada di server, logikanya menjadi cukup sederhana. Menggunakan bantuan module `os`, `scandir()` dapat digunakan untuk mendapatkan iterables berupa seluruh entri yang ada di dalam suatu direktori. Iterables kemudian dipilah sehingga hanya diambil nama entri dari suatu file saja. Hasil pemilihan akan menghasilkan array `filenames` yang selanjutnya dijadikan payload untuk dikirimkan ke client.
 
 ```python
-def send_msg(sock, data):
-    header = struct.pack(">I", len(data))
+def send_msg(sock, tag, data):
+    header = struct.pack(">BI", tag, len(data))
     sock.sendall(header + data)
 ```
 
-Fungsi `send_msg()` di atas ini akan membungkus payload dengan panjang data dan kemudian dikirimkan secara kesleuruhan. Alasan dari penggunaan fixed-length header disini adalah karena payload yang dikirim dapat dipastikan tidak terlalu besar, sehingga tidak terlalu meningkatkan kompleksitas kode.
+Fungsi `send_msg()` di atas ini akan membungkus payload dengan tipe payload dan panjang data dan kemudian dikirimkan secara keseluruhan. Alasan dari penggunaan fixed-length header disini adalah karena payload yang dikirim dapat dipastikan tidak terlalu besar, sehingga tidak terlalu meningkatkan kompleksitas kode.
 
 Dari sisi client, client mengirim payload command terlebih dahulu lalu dilayani oleh server. Dilanjutkan dengan blocking `recv()` sampai data diterima seutuhnya. Karena tidak terdapat informasi yang jelas terkait implementasi list, diasumsikan perintah `/list` ini akan mendaftar seluruh file yang ada di direktori root yang sudah ditentukan saat inisialisasi objek `Server`.
 
+Dari sisi client, pada main thread, client mengirim payload command terlebih dahulu yang kemudian akan dilayani oleh server. Pada thread client yang bertugas sebagai receiver akan menangkap payload list yang dikirim oleh server dan kemudian dilakukan print pada terminal client.
 ```python
-    def list(self):
-        self.send_msg(b"/list")
-        data = self.recv_msg()
-        print(data.decode())
+self.send_msg(b"/list")
 ```
 
-Pada fungsi `recv_msg()` diterapkan mekanisme unpacking fixed-length header.
+```python
+while self.running:
+    header = self.socket.recv(1)
+    
+    if not header: 
+        break
 
+    tag, = struct.unpack(">B", header)
+
+    if tag == T_MSG:
+        msg = self.recv_msg()
+        print(msg.decode())
+```
+
+Pada fungsi `recv_msg()` diterapkan mekanisme unpacking fixed-length header sebagai berikut.
 ```python
 def recv_msg(self):
     header = self.socket.recv(4)
-
-    if len(header) < 4:
-        return None
-
     length = struct.unpack(">I", header)[0]
-
+    
     buffer = b''
     while len(buffer) < length:
         buffer += self.socket.recv(length - len(buffer))
@@ -420,81 +451,125 @@ def recv_msg(self):
     return buffer
 ```
 
-Perhatikan pengecekan apabila panjang header kurang dari 4. Pengecekan tersebut bertujuan agar client dapat menangani empty packet yang dikirimkan oleh server ketika socket client ditutup.
-
-
 #### Client Command: `/upload <filename>`
 
-Tanpa memerhatikan edge cases umum, implementasi command `/upload` sangatlah sederhana karena upload sebatas file-file yang ada di relative directory. Berikut adalah logika untuk menangani upload pada server.
-
+Berikut adalah logika untuk handling command upload dari sisi server. Sesuai dengan permintaan tugas, command upload hanya akan mengirimkan payload filename, sehingga cukup diasumsikan apabila client mengirimkan file yang ada pada relative path program client berjalan.
 ```python
 def handle_upload(self, sock, filename):
-    filepath = f"{self.root_dir}/{filename}"
-    recv_file(sock, filepath)
-```
+    filepath = os.path.join(self.root_dir, filename)
+    file = open(filepath, "wb")
 
-Pengiriman file besar dari client ke server cukup berisiko tinggi. Oleh karena itu, pada `recv_file()` diimplementasikan chunked blocks header sehingga file besar tidak seutuhnya disimpan dalam memori terlebih dahulu sebelum pengiriman, yang mana dapat meningkatkan reliabilitas pengiriman.
-```python
-def recv_file(sock, path):
-    with open(path, "wb") as f:
-        while True:
-            length = struct.unpack(">I", sock.recv(4))[0]
-            if length == 0:
-                break
+    while True:
+        tag, length = struct.unpack(">BI", sock.recv(5))
+
+        if tag == T_FCHUNK:
             buffer = b""
             while len(buffer) < length:
                 buffer += sock.recv(length - len(buffer))
-            f.write(buffer)
+            file.write(buffer)
+
+        elif tag == T_FEND:
+            file.close()
+            send_msg(sock, T_MSG, f"File {filename} has been uploaded.".encode())
+            return True
 ```
 
-Tidak jauh berbeda dari sisi client, yakni cukup kebalikan dari sisi server. 
-```python
-def upload(self, path):
-    self.send_msg(f"/upload {os.path.basename(path)}".encode())
-    self.send_file(path)
+Dapat diperhatikan pada potongan kode di atas, fungsi tersebut akan terus menerus melakukan blocking sampai pada akhirnya diterima payload yang menunjukkan akhir dari pengiriman file. Penentuan jenis payload didasarkan pada header awal yang berisi tag payload yang diterima.
 
-def send_file(sock, path, chunk_size=4096):
+Dari sisi client, input dari user akan diparse lalu dikirimkan sebagai payload. Sebelum pengiriman, sisi client harus memastikan apakah file yang akan di-upload memang benar adanya. Jika tidak, maka dilakukan print error.
+```python
+elif args[0] == "/upload":
+    filename = os.path.basename(args[1])
+    if os.path.isfile(filename):
+        self.send_msg(f"/upload {filename}".encode())
+        self.send_file(filename)    
+    else:
+        print(f"File {filename} does not exist.")
+```
+
+Pengiriman file besar dari client ke server cukup berisiko tinggi. Oleh karena itu, pada client, `send_file()` diimplementasikan dengan chunked blocks header. Dengan demikian, file besar tidak seutuhnya disimpan dalam memori terlebih dahulu sebelum pengiriman, yang mana dapat meningkatkan reliabilitas pengiriman.
+```python
+def send_file(self, path, chunk_size=4096):
     with open(path, "rb") as f:
         while True:
             chunk = f.read(chunk_size)
             if not chunk:
                 break
-            sock.sendall(struct.pack(">I", len(chunk)) + chunk)
-    sock.sendall(struct.pack(">I", 0))
+            self.socket.sendall(struct.pack(">BI", T_FCHUNK, len(chunk)) + chunk)
+    self.socket.sendall(struct.pack(">BI", T_FEND, 0))
 ```
+Perhatikan juga pada setiap pemanggilan mehod `sendall()`. Setiap payload yang dikirimkan juga dibungkus dengan tag payload. `T_FCHUNK` menunjukkan bahwa payload merupakan bagian dari suatu data, sementara `T_FEND` menunjukkan bahwa pengiriman file selesai secara sempurna.
 
 #### Client Command: `/download <filename>`
 
-Berikut adalah logika dari sisi server:
+Berikut adalah logika download dari sisi server. Kurang lebih mirip dengan logika upload dari sisi client. Perbedaan utamanya disini, tidak mudah untuk memberi tahu client apabila file yang diminta ternyata tidak terdapat di server. Salah satu handling yang paling masuk akal adalah dengan menggunakan tag payload yang menunjukkan error file tidak dapat ditemukan.
 ```python
 def handle_download(self, sock, filename):
     filepath = f"{self.root_dir}/{filename}"
-    send_file(sock, filepath)
 
-def send_file(sock, path, chunk_size=4096):
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
-            sock.sendall(struct.pack(">I", len(chunk)) + chunk)
-    sock.sendall(struct.pack(">I", 0))
+    if os.path.isfile(filepath):
+        send_msg(sock, T_FREADY, filename.encode())
+        send_file(sock, filepath)
+        return True
+    else:
+        send_msg(sock, T_FNOTFOUND, filename.encode())
+        return False
 ```
 
-Berikut adalah logika dari sisi client:
+Dari sisi client logikanya lumayan panjang, tetapi pada intinya cukup sederhana. CLient yang berjalan memiliki dua thread yang masing-masing bertanggung jawab atas operasi send dan receive. Thread yang bertugas atas receiver akan menangkap seluruh payload yang dikirimkan oleh server dan menentukan handling yang sesuai berdasarkan tag payloadnya. Khusus command download, dibutuhkan empat tag, antara lain `T_FREADY`, `T_FCHUNK`, `T_FNOTFOUND`, dan `T_FEND`. Tag `T_FREADY` dan `T_FNOTFOUND` penting untuk memastikan terlebih dahulu apakah file memang benar ada di server.
 ```python    
-def download(self, filename):
-    self.send_msg(f"/download {filename}".encode())
-    filepath = f"{self.download_dir}/{filename}"
+def receive_all(self):
+    filename = ''
+    filepath = ''
+    file = None
 
-    print(f"Downloading {filename}...")
+    while self.running:
+        header = self.socket.recv(1)
+        
+        if not header: 
+            break
 
-    self.recv_file(filepath)
+        tag, = struct.unpack(">B", header)
 
-    print(f"File {filename} downloaded.")
+        if tag == T_MSG:
+            msg = self.recv_msg()
+            print(msg.decode())
+
+        elif tag == T_FREADY:
+            filename = self.recv_msg().decode()
+            print(f"Server is ready to send {filename}.")
+            filepath = os.path.join(self.download_dir, filename)
+            file = open(filepath, "wb")
+
+        elif tag == T_FNOTFOUND:
+            filename = self.recv_msg().decode()
+            print(f"{filename} does not exist on the server.")
+            filename = ''
+
+        elif tag == T_FCHUNK:
+            print(f"Downloading {filename}...")
+            length = struct.unpack(">I", self.socket.recv(4))[0]
+            buffer = b""
+            while len(buffer) < length:
+                buffer += self.socket.recv(length - len(buffer))
+            file.write(buffer)
+
+        elif tag == T_FEND:
+            if file:
+                file.close()
+                file = None
+            print(f"{filename} downloaded")
+            filename = ''
+            filepath = ''
 ```
-
-Dapat diperhatikan implementasi perintah `/download` pada server dan client di atas. Tidak jauh berbeda dengan `/upload`, yakni hanya sebatas melakukan download file-file yang berada di root directory server. Dengan alasan yang sama dengan implementasi `/upload`, digunakan pula chunked blocks header untuk framing payload. 
+Secara implementasi handling kurang lebih sama seperti bagaimana cara menyimpan file hasil upload dari sisi server.
 
 ## Screenshot Hasil
 
+- Download:
+
+    ![](/assets/download.gif)
+
+- Upload:
+
+    ![](/assets/upload.gif)
