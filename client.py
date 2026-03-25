@@ -2,23 +2,22 @@ import socket
 import struct
 import os
 import threading
-import queue
+
+T_FREADY = 0x10
+T_FCHUNK = 0x11
+T_FEND = 0x12
+T_FNOTFOUND = 0x19
+T_MSG = 0x21
 
 class Client:
     def __init__(self, HOST, PORT, download_dir):
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.connect((HOST, PORT))
-        self.socket.settimeout(10.0)
-
-        print("Connected to server.")
 
         self.download_dir = os.path.expanduser(download_dir)
         self.running = True
-        self.socket_read_lock = threading.Lock()
-        self.response_queue = queue.Queue()
 
-        listener_thread = threading.Thread(target=self.listen_for_messages, daemon=True)
-        listener_thread.start()
+        threading.Thread(target=self.receive_all, daemon=True).start()
 
         self.handle_command()
 
@@ -35,64 +34,90 @@ class Client:
                     continue
 
                 if args[0] == "/list":
-                    self.list()
+                    self.send_msg(b"/list")
                 elif args[0] == "/upload":
-                    self.upload(args[1])                
+                    filename = os.path.basename(args[1])
+                    if os.path.isfile(filename):
+                        self.send_msg(f"/upload {filename}".encode())
+                        self.send_file(filename)    
+                    else:
+                        print(f"File {filename} does not exist.")
                 elif args[0] == "/download":
-                    self.download(args[1])
+                    self.send_msg(f"/download {os.path.basename(args[1])}".encode())
                 else:
                     print("Command unidentified.")
                     continue
         except KeyboardInterrupt:
             print("\nDisconnected by keyboard interrupt. Exiting...")
         finally:
-            self.running = False
             self.socket.close()
+    
+    def receive_all(self):
+        filename = ''
+        filepath = ''
+        file = None
+
+        while self.running:
+            header = self.socket.recv(1)
+            
+            if not header: 
+                break
+
+            tag, = struct.unpack(">B", header)
+
+            if tag == T_MSG:
+                msg = self.recv_msg()
+                print(msg.decode())
+
+            elif tag == T_FREADY:
+                filename = self.recv_msg().decode()
+                print(f"Server is ready to send {filename}.")
+                filepath = os.path.join(self.download_dir, filename)
+                file = open(filepath, "wb")
+
+            elif tag == T_FNOTFOUND:
+                print(f"{filename} does not exist on the server.")
+
+            elif tag == T_FCHUNK:
+                print(f"Downloading {filename}...")
+                length = struct.unpack(">I", self.socket.recv(4))[0]
+                buffer = b""
+                while len(buffer) < length:
+                    buffer += self.socket.recv(length - len(buffer))
+                file.write(buffer)
+
+            elif tag == T_FEND:
+                if file:
+                    file.close()
+                    file = None
+                print(f"{filename} downloaded")
+                filename = ''
+                filepath = ''
+
+    def recv_file(self, path):
+        with open(path, "wb") as f:
+            while True:
+                length = struct.unpack(">I", self.socket.recv(4))[0]
+                if length == 0:
+                    break
+                buffer = b""
+                while len(buffer) < length:
+                    buffer += self.socket.recv(length - len(buffer))
+                f.write(buffer)          
 
     def recv_msg(self):
-        try:
-            return self.response_queue.get(timeout=5)
-        except queue.Empty:
-            return None
+        header = self.socket.recv(4)
+        length = struct.unpack(">I", header)[0]
+        
+        buffer = b''
+        while len(buffer) < length:
+            buffer += self.socket.recv(length - len(buffer))
+
+        return buffer
     
     def send_msg(self, data):
-        header = struct.pack(">I", len(data))
+        header = struct.pack(">BI", T_MSG, len(data))
         self.socket.sendall(header + data)
-    
-    def listen_for_messages(self):
-        while self.running:
-            if not self.socket_read_lock.acquire(timeout=0.1):
-                continue
-            
-            try:
-                msg = self._read_msg()
-                if msg is None:
-                    break
-                
-                decoded = msg.decode()
-                if any(keyword in decoded for keyword in ["Client", "connected", "downloaded", "uploaded"]):
-                    print(f"[SERVER] {decoded}")
-                else:
-                    self.response_queue.put(msg)
-            except socket.timeout:
-                continue
-            except (ConnectionResetError, OSError):
-                break
-            finally:
-                self.socket_read_lock.release()
-    
-    def _read_msg(self):
-        try:
-            header = self.socket.recv(4)
-            if len(header) < 4:
-                return None
-            length = struct.unpack(">I", header)[0]
-            buffer = b''
-            while len(buffer) < length:
-                buffer += self.socket.recv(length - len(buffer))
-            return buffer
-        except socket.timeout:
-            raise
     
     def send_file(self, path, chunk_size=4096):
         with open(path, "rb") as f:
@@ -100,55 +125,8 @@ class Client:
                 chunk = f.read(chunk_size)
                 if not chunk:
                     break
-                self.socket.sendall(struct.pack(">I", len(chunk)) + chunk)
-        self.socket.sendall(struct.pack(">I", 0))
-    
-    def recv_file(self, path):
-        with open(path, "wb") as f:
-            while True:
-                try:
-                    length = struct.unpack(">I", self.socket.recv(4))[0]
-                except socket.timeout:
-                    continue
-                if length == 0:
-                    break
-                buffer = b""
-                while len(buffer) < length:
-                    try:
-                        buffer += self.socket.recv(length - len(buffer))
-                    except socket.timeout:
-                        continue
-                f.write(buffer)
-
-    def list(self):
-        self.send_msg(b"/list")
-        data = self.recv_msg()
-        print(data.decode(), end='')
-
-    def upload(self, path):
-        path = os.path.expanduser(path)
-        with self.socket_read_lock:
-            self.send_msg(f"/upload {os.path.basename(path)}".encode())
-            self.send_file(path)
-        
-        resp = self.recv_msg()
-        if resp:
-            print(resp.decode(), end='')
-
-    def download(self, filename):
-        with self.socket_read_lock:
-            self.send_msg(f"/download {filename}".encode())
-            filepath = f"{self.download_dir}/{filename}"
-            print(f"Downloading {filename}...")
-            self.recv_file(filepath)
-
-        print(f"File {filename} downloaded.")
-        
-        while True:
-            try:
-                msg = self.response_queue.get_nowait()
-            except queue.Empty:
-                break        
+                self.socket.sendall(struct.pack(">BI", T_FCHUNK, len(chunk)) + chunk)
+        self.socket.sendall(struct.pack(">BI", T_FEND, 0))
 
 if __name__ == "__main__":
     server_ip = input("Enter server's IP: ").strip()
